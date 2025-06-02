@@ -93,6 +93,10 @@ Difference betwwen require, include, extend and prepend
 
         User.new.greet  #=> "Hello from module!"
 
+  Think of it like:
+    include - adds behavior
+    extend - adds class behavior
+    prepend - overrides behavior
 
 ➤ Mixins in Ruby act as an alternative to multiple inheritance, similar to how multiple inheritance works in C++.
     - Ruby follows a single inheritance model, meaning a class can inherit from only one parent class.
