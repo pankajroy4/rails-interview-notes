@@ -62,6 +62,15 @@ Russian Doll Caching
   Fragment Caching = caching any individual block (could be outer or inner)
   So when you nest fragment caches inside each other, it becomes Russian Doll Caching — just like dolls inside dolls.
 
+  Use it when:
+    You have parent-child nested views
+    Each object changes independently
+    You want to optimize partial rendering
+
+   When Not to Use It?
+    If objects change together every time — just cache the whole thing
+    If your data is highly dynamic and cache invalidation overhead is high
+
 Cache Invalidation — How It Works
 =================================
   Rails uses cache_key_with_version, which includes: Model name, ID, updated_at
