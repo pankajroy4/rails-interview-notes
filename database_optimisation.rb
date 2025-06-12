@@ -122,7 +122,7 @@ Database Indexing in Rails (Part - 2)
         | Foreign keys         | always index them    |
 
 
-Transactions, Isolation Levels, and Race Conditions in Rails (Advance)
+Transactions and Isolation Levels in Rails (Advance)
 ======================================================================
   ➤ These are critical concepts when multiple users hit your app at once — e.g., ticket bookings, payments, inventory updates.
   
@@ -273,7 +273,7 @@ Transactions, Isolation Levels, and Race Conditions in Rails (Advance)
           end
         end
 
-      Here we might think that: Since Sidekiq jobs already run one by one in a queue, why do we still need transaction(isolation: :serializable) or locking inside      them?
+      Here we might think that: Since Sidekiq jobs already run one by one in a queue, why do we still need transaction(isolation: :serializable) or locking inside them?
 
         ➤ Sidekiq guarantees job-level FIFO within a queue.
           BUT:
@@ -289,7 +289,202 @@ Transactions, Isolation Levels, and Race Conditions in Rails (Advance)
             Grabs a connection.
             Starts a transaction.
             Queries for an available seat.
-            Now if two threads find the same seat is available, they may try to book it at the same time. This is waht the problem might occur.
+            Now if two threads find the same seat is available, they may try to book it at the same time. This is what the problem might occur.
 
  Race Conditions in DB
  ========================
+  ➤ A race condition occurs when two or more concurrent operations access the same data, and at least one of them modifies it, causing unintended or incorrect results.
+  Example (Bank Transfer). Assume account has ₹10.
+
+    account = Account.find(1)
+    account.balance -= 5
+    account.save
+  
+  Now if two threads/users do this at the same time, both fetch balance as ₹10 and both save ₹5. But it should have been ₹5 and ₹0.
+  This is a race condition: because both read before any write is committed.
+
+  ➤ There are different ways to solve race conditons:
+     
+     ╰┈➤ Pessimistic Locking (SELECT ... FOR UPDATE)
+         🔸You lock the row during the transaction, so no other process can read or write until you are done.
+
+          ActiveRecord::Base.transaction do
+            account = Account.lock.find(1) # SELECT ... FOR UPDATE
+            account.balance -= 5
+            account.save!
+          end
+
+         🔸Useful when you want to process queue-like jobs from DB rows, and skip locked rows.
+
+          ActiveRecord::Base.transaction do
+            ticket = Ticket.where(status: 'pending').lock("FOR UPDATE SKIP LOCKED").first
+            ticket.update!(status: 'processing')
+          end
+          
+         🔸Locks row until transaction ends.
+         🔸Other transactions trying to SELECT ... FOR UPDATE  or SELECT ... FOR UPDATE SKIP LOCKED must wait.
+
+         🔸When to use:
+           - High-concurrency writes. For example Inventory, ticket booking, bank balance.
+           - You must prevent simultaneous updates. 
+
+     ╰┈➤ Atomic Updates using update_counters or raw SQL
+         🔸An atomic update is a single SQL operation that reads and writes in one step, so there is no chance of race condition.
+         🔸Unlike the usual read → modify → write, atomic updates do not read the value first in Ruby. They just tell the DB:
+               "Go and decrement/increment this value directly!"
+
+          ⭐ Atomic Way — Using update_counters
+              User.update_counters(1, coins: -10)
+             This generates SQL like: UPDATE users SET coins = coins - 10 WHERE id = 1
+            
+            It tells the database: "You handle this. Subtract 10 from coins."
+            Since this SQL is executed atomically by the DB, no other operation can sneak in between.
+
+          ⭐ Atomic Way — Using Raw SQL (update_all)
+              User.where(id: 1).update_all("coins = coins - 10")
+             This generates SQL like: UPDATE users SET coins = coins - 10 WHERE id = 1
+            
+            Works the same as update_counters, but update_all is more flexible — you can use expressions, conditions, and more complex SQL.
+
+         🔸When to use:
+           - You are only modifying a numeric value (e.g., coins, likes, view_count).
+           - You do not need to validate or run callbacks.
+           - Performance matters — it is faster, since it is just one SQL query.
+          
+          Example:
+            Instead of:
+              post = Post.find(1)
+              post.likes += 1
+              post.save
+            we should do:
+              Post.update_counters(1, likes: 1)
+            Or we should do:
+              Post.where(id: 1).update_all("likes = likes + 1")
+
+
+     ╰┈➤ Optimistic Locking (lock_version)
+          This will allow concurrent reads, but detect conflict at save.
+          Detect and prevent conflicting updates when multiple users/processes try to update the same database record at the same time.
+          It does not lock the row in the database like pessimistic locking. Instead, it checks:
+              "Has this record changed since I last read it?"
+          If yes → it throws an error and blocks the update.
+
+          ⭐ How it Works in Rails:
+              Add lock_version to the table. In migration:
+                  add_column :users, :lock_version, :integer, default: 0, null: false
+                This column keeps track of how many times the row has been updated.
+
+              Rails handle it automatically. We do not need to write special logic. ActiveRecord will:
+               🔸Read lock_version when loading the object.
+               🔸Add a condition in the UPDATE like this: UPDATE users SET name = 'Roy', lock_version = 1 WHERE id = 1 AND lock_version = 0
+
+              If the lock_version of row is not 0, this update fails
+
+          Example: 
+            Two processes load same record:
+              # User A and User B
+              user = User.find(1)  # lock_version = 0
+            User A updates name:
+              user.name = "Roy"
+              user.save  # Succeeds → lock_version becomes 1
+            Now User B updates email:
+              user.email = "test@example.com"
+              user.save  # Fails → raises ActiveRecord::StaleObjectError
+            Why? Because User B’s object has lock_version = 0, but DB now has lock_version = 1.
+
+          ⭐ What Happens Internally?
+            - Rails adds this condition to the SQL: WHERE id = 1 AND lock_version = 0
+            - If no rows match, Rails knows someone else already changed it.
+
+          ⭐ What to Do When it Fails?
+            - We handle the ActiveRecord::StaleObjectError:
+                begin
+                  user.save!
+                rescue ActiveRecord::StaleObjectError
+                  puts "Another process updated this record first. Please reload and try again."
+                end
+
+          You can:
+            - Reload the record and retry
+            - Show a message to user
+            - Use conflict resolution strategies (like merging fields)
+
+         🔸When to use:
+           - Lower chance of collisions.
+           - Want to avoid locking but detect and handle conflicts.
+           - Ideal for web forms, background workers, or slow UIs.
+
+
+Deadlocks, Queueing, and Locking Strategies in High-Concurrency Apps
+=====================================================================
+➤ Deadlocks:
+   - A deadlock happens when two or more processes wait on each other to release locks, and none can proceed.
+     Example: 
+        Transaction A locks row 1 → waits for row 2
+        Transaction B locks row 2 → waits for row 1
+     Both are stuck → deadlock error. ActiveRecord::Deadlocked
+
+  How Rails/DB handles deadlock?
+    DB (like PostgreSQL or MySQL) detects deadlocks.
+    It kills one transaction with an error: PG::DeadlockDetected: ERROR: deadlock detected
+
+
+  ⭐Preventing Deadlocks
+  ----------------------
+    ╰┈➤Best Practices:
+        🔸Access tables/rows in consistent order: Always lock Train → then Seats
+        🔸Keep transactions short: Do not perform heavy logic or I/O inside a transaction
+        🔸Avoid unnecessary locks: Use .select instead of .find if you do not plan to update
+        🔸Use DB indexes wisely: Without indexes, locks may escalate to table-level
+        🔸Use advisory locks (Postgres only):
+            ActiveRecord::Base.connection.execute("SELECT pg_advisory_lock(12345)")
+            # Perform critical work
+            ActiveRecord::Base.connection.execute("SELECT pg_advisory_unlock(12345)")
+         🔹 Note: Advisory locks do not block other operations unless all parties use them.
+
+    ╰┈➤App-level Lock( Redis + Sidekiq) And Database-level Lock(Pessimistic Locking):
+        🔹App-level locking (Redis): Prevents multiple workers from starting booking logic for the same user/train combo.
+            lock_key = "booking_lock:user:#{user_id}:train:#{train_id}"
+            locked = Redis.current.set(lock_key, "locked", nx: true, ex: 30)
+
+            nx: true => Set only if not already set (non-blocking lock)
+            ex: 30 => Auto-expire after 30s (avoids deadlock if job crashes)
+
+        🔹DB-level locking (Postgres): Guarantees only one booking can succeed by locking the seat row.
+
+        🛡 Use App-Level Lock (Redis) to avoid starting duplicate jobs.
+        🔒 Use DB-Level Lock to guarantee consistency even under race conditions.
+
+         Example:
+          class BookingWorker
+            include Sidekiq::Worker
+
+            def perform(user_id, train_id)
+              lock_key = "booking_lock:user:#{user_id}:train:#{train_id}"
+              locked = Redis.current.set(lock_key, "locked", nx: true, ex: 30)
+              unless locked
+                logger.info "Booking already in progress for user #{user_id}"
+                return
+              end
+
+              begin
+                User.transaction(isolation: :serializable) do
+                  seat = Seat.lock("FOR UPDATE SKIP LOCKED").find_by(train_id: train_id, available: true)
+                  raise "No seats available" unless seat
+
+                  seat.update!(available: false, user_id: user_id)
+                end
+              ensure
+                Redis.current.del(lock_key)
+              end
+            end
+          end
+
+
+    ╰┈➤Logging and Monitoring Concurrency:
+        Detect Deadlocks
+          Enable DB logs: log_min_error_statement = 'error' in PostgreSQL
+          Check Sidekiq retries (failed jobs)
+        Use Monitoring Tools
+          New Relic, Datadog, or Skylight to monitor DB load
+          Redis + Sidekiq dashboard for queue inspection
