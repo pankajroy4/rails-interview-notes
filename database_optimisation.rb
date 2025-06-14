@@ -322,7 +322,7 @@ Transactions and Isolation Levels in Rails (Advance)
           end
           
          🔸Locks row until transaction ends.
-         🔸Other transactions trying to SELECT ... FOR UPDATE  or SELECT ... FOR UPDATE SKIP LOCKED must wait.
+         🔸Other transactions trying to SELECT ... FOR UPDATE  or SELECT ... FOR UPDATE SKIP LOCKED must wait or skip.
 
          🔸When to use:
            - High-concurrency writes. For example Inventory, ticket booking, bank balance.
